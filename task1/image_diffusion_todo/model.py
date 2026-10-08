@@ -24,23 +24,48 @@ class DiffusionModule(nn.Module):
     
     def get_loss_x0(self, x0, class_label=None, noise=None):
         ######## TODO ########
-        # Here we implement the "predict x0" version.
+        # Here we implement the "predict x0" version. # 直接預測乾淨(無噪)影像
         # 1. Sample a timestep and add noise to get (x_t, noise).
+        B = x0.shape[0]
+        t = self.var_scheduler.uniform_sample_t(B, x0.device)
+        x_t, noise = self.var_scheduler.add_noise(x0, t, eps=noise)
         # 2. Pass (x_t, timestep) into self.network, where the output should represent the clean sample x0_pred.
+        if class_label is not None:
+            x0_pred = self.network(x_t, t, class_label) # class_label : 條件控制標籤，可控模型定向生成
+        else:
+            x0_pred = self.network(x_t, t)
         # 3. Compute the loss as MSE(predicted x0_pred, ground-truth x0).
+        loss = F.mse_loss(x0_pred, x0)
         ######################
-        loss = None
+        #loss = None
         return loss
     
     def get_loss_mean(self, x0, class_label=None, noise=None):
         ######## TODO ########
         # Here we implement the "predict mean" version.
         # 1. Sample a timestep and add noise to get (x_t, noise).
+        B = x0.shape[0]
+        t = self.var_scheduler.uniform_sample_t(B, x0.device)
+        x_t, noise = self.var_scheduler.add_noise(x0, t, eps=noise)
         # 2. Pass (x_t, timestep) into self.network, where the output should represent the posterior mean μθ(x_t, t).
-        # 3. Compute the *true* posterior mean from the closed-form DDPM formula (using x0, x_t, noise, and scheduler terms).
+        # 直接預測反向去噪時所需要的平均值
+        if class_label is not None:
+            mean_pred = self.network(x_t, t, class_label)
+        else:
+            mean_pred = self.network(x_t, t)
+        # 3. Compute the *true* posterior mean from the closed-form DDPM formula (using x0, x_t, and scheduler terms).
+        alpha_bar_t = extract(self.var_scheduler.alphas_cumprod, t, x0)
+        alpha_t = extract(self.var_scheduler.alphas, t, x0)
+        beta_t = extract(self.var_scheduler.betas, t, x0)
+        t_prev = (t - 1).clamp(min=0)
+        alpha_bar_prev = extract(self.var_scheduler.alphas_cumprod, t_prev, x0)
+        alpha_bar_prev = torch.where((t == 0).reshape(-1, 1, 1, 1), torch.ones_like(alpha_bar_prev), alpha_bar_prev)
+        
+        true_mean = ((torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t)) * x0 + (torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t)) * x_t)
         # 4. Compute the loss as MSE(predicted mean, true mean).
+        loss = F.mse_loss(mean_pred, true_mean)
         ######################
-        loss = None
+        #loss = None
         return loss
     
     def get_loss(self, x0, class_label=None, noise=None):
@@ -84,7 +109,9 @@ class DiffusionModule(nn.Module):
             # create a tensor of shape (2*batch_size,) where the first half is filled with zeros (i.e., null condition).
             assert class_label is not None
             assert len(class_label) == batch_size, f"len(class_label) != batch_size. {len(class_label)} != {batch_size}"
-            raise NotImplementedError("No need to implement cfg in assignment 2")
+            #raise NotImplementedError("TODO")
+            class_label = class_label.to(self.device)
+            class_label = torch.cat([torch.zeros_like(class_label), class_label], dim=0)
             #######################
 
         traj = [x_T]
@@ -93,7 +120,17 @@ class DiffusionModule(nn.Module):
             if do_classifier_free_guidance:
                 ######## CFG ########
                 # Implement the classifier-free guidance.
-                raise NotImplementedError("No need to implement cfg in assignment 2")
+                # Assignment 2. Implement the classifier-free guidance.
+                #raise NotImplementedError("TODO")
+                x_t_input = torch.cat([x_t, x_t], dim=0)
+                # 將合併後的影像、時間步長與類別標籤輸入神經網路
+                # 另此處傳入的 class_label 前半段通常已設為 null token
+                timestep = torch.full((2 * batch_size,), t.item(), device=self.device, dtype=torch.long)
+                net_out = self.network(x_t_input, timestep=timestep, class_label=class_label)
+                # 將網路輸出沿 batch 維度對半拆開，分別取得無條件預測與條件預測結果
+                net_out_uncond, net_out_cond = net_out.chunk(2, dim=0)
+                # 利用 guidance_scale (s) 強化符合 class_label 的特徵方向，同時壓制無條件的通用特徵
+                net_out = net_out_uncond + guidance_scale * (net_out_cond - net_out_uncond)
                 #######################
             else:
                 # 如果是 conditional 就傳 class_label，否則就兩個參數
