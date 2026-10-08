@@ -81,12 +81,21 @@ class UNet(nn.Module):
                 
                 ######## CFG ########
                 # Implement random null conditioning in CFG training.
-                raise NotImplementedError("No need to implement cfg in assignment 2")
+                # Assignment 2. Implement random null conditioning in CFG training.
+                # Randomly drop class conditions.
+                # A dropped condition is represented by class label 0.
+                drop_mask = (torch.rand(class_label.shape, device=class_label.device) < self.cfg_dropout)
+                class_label = torch.where(drop_mask, torch.zeros_like(class_label), class_label)
                 #######################
             
             ######## CFG ########
             # Implement class conditioning
-            raise NotImplementedError("No need to implement cfg in assignment 2")
+            # Assignment 2. Implement class conditioning
+            # Convert class labels into class embeddings.
+            cemb = self.class_embedding(class_label)
+            # Combine timestep information and class information.
+            temb = temb + cemb
+            #raise NotImplementedError("TODO")
             #######################
 
         # Downsampling
