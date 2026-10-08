@@ -176,14 +176,58 @@ class DiffusionModule(nn.Module):
         # NOTE: This code is used for assignment 2. You don't need to implement this part for assignment 1.
         # DO NOT change the code outside this part.
         # compute x_t_prev based on ddim reverse process.
-        alpha_prod_t = extract(self.var_scheduler.alphas_cumprod, t, xt)
+        # 抽出 (extract)」當前時間步 $t$ 對應的那個 alpha_bar 數值，以便拿來進行後續的 DDIM 數學計算
+        alpha_prod_t = extract(self.var_scheduler.alphas_cumprod, t, xt) 
         if t_prev >= 0:
             alpha_prod_t_prev = extract(self.var_scheduler.alphas_cumprod, t_prev, xt)
         else:
             alpha_prod_t_prev = torch.ones_like(alpha_prod_t)
 
         x_t_prev = xt
+        # Convert both timesteps to one-dimensional LongTensors.
+        # During sampling these usually contain one timestep shared by
+        # the whole batch.
+        t = torch.as_tensor(t, device=xt.device).reshape(-1).long()
+        t_prev = torch.as_tensor(t_prev, device=xt.device).reshape(-1).long()
 
+        # alpha_prod_t     = alpha_bar_t
+        # alpha_prod_t_prev = alpha_bar_{t_prev}
+        alpha_prod_t = extract(self.var_scheduler.alphas_cumprod, t, xt)
+
+        # There is no actual timestep -1 in the scheduler.
+        # For the final step, define alpha_bar_{-1} = 1.
+        if torch.all(t_prev >= 0):
+            alpha_prod_t_prev = extract(
+                self.var_scheduler.alphas_cumprod,
+                t_prev,
+                xt,
+            )
+        else:
+            alpha_prod_t_prev = torch.ones_like(alpha_prod_t)
+
+        # Predict the noise epsilon_theta(x_t, t).
+        eps_pred = self.network(xt, t)
+
+        # Estimate the clean sample x_0: p.65
+        # x_0_hat = (x_t - sqrt(1 - alpha_bar_t) * eps_pred) / sqrt(alpha_bar_t)
+        pred_x0 = (xt - torch.sqrt(torch.clamp(1.0 - alpha_prod_t, min=0.0)) * eps_pred) / torch.sqrt(alpha_prod_t)
+
+        # DDIM standard deviation: p.64
+        # sigma_t^2 = eta^2 * (1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev)
+        # eta = 0 gives deterministic DDIM sampling.
+        # eta = 1 same as DDPM
+        # beta_t = (1.0 - alpha_prod_t / alpha_prod_t_prev)
+        sigma = eta * torch.sqrt(torch.clamp(((1.0 - alpha_prod_t_prev) / (1.0 - alpha_prod_t) * (1.0 - alpha_prod_t / alpha_prod_t_prev)), min=0.0))
+
+        # This is the direction determined by the predicted noise. p.61
+        direction = torch.sqrt(torch.clamp(1.0 - alpha_prod_t_prev - sigma.square(), min=0.0)) * eps_pred
+
+        # Add random noise only when eta > 0.
+        noise = torch.randn_like(xt)
+
+        # Complete DDIM update: p.61
+        # x_{t_prev} = sqrt(alpha_bar_prev) * x_0_hat + direction + sigma_t * z
+        x_t_prev = (torch.sqrt(alpha_prod_t_prev) * pred_x0 + direction + sigma * noise)
         ######################
         return x_t_prev
 
@@ -203,19 +247,26 @@ class DiffusionModule(nn.Module):
         # NOTE: This code is used for assignment 2. You don't need to implement this part for assignment 1.
         # DO NOT change the code outside this part.
         # sample x0 based on Algorithm 2 of DDPM paper.
-        step_ratio = self.var_scheduler.num_train_timesteps // num_inference_timesteps
+        step_ratio = self.var_scheduler.num_train_timesteps // num_inference_timesteps # decide how many steps to skip per time
         timesteps = (
             (np.arange(0, num_inference_timesteps) * step_ratio)
-            .round()[::-1]
-            .copy()
+            .round()[::-1] # 因去噪是從最後一步倒著走回第 0 步，所以需陣列反轉
+            .copy() # rearrange
             .astype(np.int64)
         )
         timesteps = torch.from_numpy(timesteps)
-        prev_timesteps = timesteps - step_ratio
+        prev_timesteps = timesteps - step_ratio # get pre-time step matrix
 
-        xt = torch.zeros(shape).to(self.device)
-        for t, t_prev in zip(timesteps, prev_timesteps):
-            pass
+        # Start from pure Gaussian noise x_T.
+        xt = torch.randn(shape, device=self.device)
+
+        # Follow the DDIM reverse process:
+        # x_t -> x_{t_prev}
+        for t, t_prev in zip(timesteps, prev_timesteps): # 1 v 1 pack together
+            t = t.to(self.device)
+            t_prev = t_prev.to(self.device)
+
+            xt = self.ddim_p_sample(xt, t, t_prev, eta=eta) # 當前的圖像 xt、t 與 t_prev 計算並回傳降噪過後的 xt
 
         x0_pred = xt
 
