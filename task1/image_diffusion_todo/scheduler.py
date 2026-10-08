@@ -339,7 +339,33 @@ class DDIMScheduler(BaseScheduler):
         #   - Store the step ratio in `self._ddim_step_ratio` for later use when computing previous t.
         #   - Compute a `step_ratio` that maps inference steps to training steps.
         # DO NOT change the code outside this part.
-        raise NotImplementedError("TODO")
+        #raise NotImplementedError("TODO")
+        # 確保使用者設定的推論步數合理
+        if not isinstance(num_inference_timesteps, int):
+            raise TypeError("num_inference_timesteps must be an integer.")
+
+        if num_inference_timesteps <= 0:
+            raise ValueError("num_inference_timesteps must be positive.")
+
+        if num_inference_timesteps > self.num_train_timesteps:
+            raise ValueError("num_inference_timesteps cannot exceed num_train_timesteps.")
+
+        # Map the shorter inference schedule to the training schedule.
+        # Example:
+        #   num_train_timesteps = 1000
+        #   num_inference_timesteps = 50
+        #   step_ratio = 20
+        # The resulting timesteps are:
+        #   980, 960, 940, ..., 20, 0
+        # 建構 \tau 的過程
+        step_ratio = self.num_train_timesteps // num_inference_timesteps
+
+        timesteps = (np.arange(0, num_inference_timesteps) * step_ratio).round()[::-1].copy().astype(np.int64)
+        # 把算出來的 step_ratio 和 timesteps 存進 self（類別本身）裡面
+        # ex. self means my_model=diffusionmodel() 這個具體的模型
+        self.num_inference_timesteps = num_inference_timesteps
+        self._ddim_step_ratio = step_ratio
+        self.timesteps = torch.from_numpy(timesteps)
         #######################
 
     def _get_teeth(self, consts: torch.Tensor, t: torch.Tensor):
@@ -362,6 +388,45 @@ class DDIMScheduler(BaseScheduler):
         ######## TODO ########
         # DO NOT change the code outside this part.
         assert predictor == "noise", "In assignment 2, we only implement DDIM with noise predictor."
-        sample_prev = None
+        #sample_prev = None
+        # Convert t to a tensor so the code works for Python integers,
+        # scalar tensors, and one-element tensors.
+        t = torch.as_tensor(t, device=x_t.device).reshape(-1).long()
+
+        # The previous DDIM timestep is separated by the inference
+        # step ratio, not necessarily by one training timestep.
+        t_prev = t - self._ddim_step_ratio
+
+        alpha_bar_t = extract(self.alphas_cumprod, t, x_t)
+
+        # When t_prev < 0, we are making the final transition to x_0.
+        # By definition, alpha_bar_{-1} = 1.
+        if torch.all(t_prev >= 0):
+            alpha_bar_prev = extract(self.alphas_cumprod, t_prev, x_t)
+        else:
+            alpha_bar_prev = torch.ones_like(alpha_bar_t)
+
+        # Estimate x_0 from the current noisy sample and predicted noise:
+        # x0_hat = (x_t - sqrt(1 - alpha_bar_t) * eps_theta) / sqrt(alpha_bar_t)
+        x0_pred = (x_t - torch.sqrt(torch.clamp(1.0 - alpha_bar_t, min=0.0)) * eps_theta) / torch.sqrt(torch.clamp(alpha_bar_t, min=1e-12))
+
+        # Keep the estimated image in the expected normalized image range. 因為反推出來的像素值可能會超出神經網路預期的正規化範圍
+        x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
+
+        # DDIM noise scale:
+        # 擔心浮點數運算出現負數，所以要確保根號內為正數
+        # sigma_t = eta * sqrt((1 - alpha_bar_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_prev))
+        sigma = self.eta * torch.sqrt(torch.clamp(((1.0 - alpha_bar_prev) / torch.clamp(1.0 - alpha_bar_t, min=1e-12) * (1.0 - alpha_bar_t / alpha_bar_prev)), min=0.0))
+
+        # Direction that carries the predicted noise from x_t
+        # toward the previous timestep.
+        direction = torch.sqrt(torch.clamp(1.0 - alpha_bar_prev - sigma.square(), min=0.0)) * eps_theta
+
+        # eta = 0 gives deterministic DDIM sampling.
+        noise = torch.randn_like(x_t)
+
+        # DDIM update:
+        # x_{t_prev} = sqrt(alpha_bar_prev) * x0_hat + direction + sigma_t * noise
+        sample_prev = (torch.sqrt(alpha_bar_prev) * x0_pred + direction + sigma * noise)
         #######################
         return sample_prev
