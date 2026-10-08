@@ -41,14 +41,25 @@ class BaseScheduler(nn.Module):
         elif mode == "cosine":
             ######## TODO ########
             # Implement the cosine beta schedule (Nichol & Dhariwal, 2021).
+            # steps=num_train_timesteps ( 擴散模型在訓練時使用的總時間步數 T )
             # Hint:
-            # 1. Define alphā_t = f(t/T) where f is a cosine schedule:
-            #       alphā_t = cos^2( ( (t/T + s) / (1+s) ) * (π/2) )
+            # 1. Define alphā_t = f(t/T) where f is a cosine schedule:
+            #       alphā_t = cos^2( ( (t/T + s) / (1+s) ) * (π/2) )
             #    with s = 0.008 (a small constant for stability).
-            # 2. Convert alphā_t into betas using:
-            #       beta_t = 1 - alphā_t / alphā_{t-1}
-            # 3. Return betas as a tensor of shape [num_train_timesteps].
-            raise NotImplementedError("TODO: Implement cosine beta schedule here!")
+            s = 0.008
+            # 2. Convert alphā_t into betas using:
+            #       beta_t = 1 - alphā_t / alphā_{t-1}
+            steps = torch.arange(num_train_timesteps + 1, dtype=torch.float32)
+            alpha_bar = torch.cos(((steps / num_train_timesteps + s) / (1 + s)) * (torch.pi / 2)) ** 2
+            alpha_bar = alpha_bar / alpha_bar[0]
+            T = self.num_train_timesteps
+            betas = 1 - (alpha_bar[1 : T + 1] / alpha_bar[0 : T])
+            # betas = 1.0 - alpha_bar[1:] / alpha_bar[:-1] 
+            # [1:] 代表「從索引 1 一路切到最尾端」，[:-1] 代表「從頭開始切，切到倒數第 1 個元素之前（不含最後一個）」。
+            # 3. Clip beta_t to at most 0.999 (singularity at t = T).
+            betas = torch.clamp(betas, max = 0.999) # 將輸入的所有元素數值限制在指定的最小值固定為正)與最大值之間
+            # 4. Return betas as a tensor of shape [num_train_timesteps].
+            #raise NotImplementedError("TODO: Implement cosine beta schedule here!")
                
         else:
             raise NotImplementedError(f"{mode} is not implemented.")
@@ -126,12 +137,45 @@ class DDPMScheduler(BaseScheduler):
             sample_prev: denoised image sample at timestep t-1
         """
         ######## TODO ########
-        # 1. Extract beta_t, alpha_t, and alpha_bar_t from the scheduler.
-        # 2. Compute the predicted mean μ_θ(x_t, t) = 1/√α_t * (x_t - (β_t/√(1-ᾱ_t)) * ε̂_θ).
-        # 3. Compute the posterior variance \tilde{β}_t = ((1-ᾱ_{t-1})/(1-ᾱ_t)) * β_t.
-        # 4. Add Gaussian noise scaled by √(\tilde{β}_t) unless t == 0.
-        # 5. Return the final sample at t-1.
-        sample_prev = None
+        # 1. Extract beta_t, alpha_t, alpha_bar_t, and alpha_bar_{t-1} from the
+        #    scheduler (ᾱ_{t-1} = 1 at t = 0).
+        # 確保 t 是一維 LongTensor，形狀為 [B]
+        t = t.reshape(-1).long().to(x_t.device)
+        # 取得每個 batch 對應 timestep 的參數，
+        # extract 會自動 reshape 成 [B, 1, 1, 1]
+        beta_t = extract(self.betas, t, x_t)
+        alpha_t = extract(self.alphas, t, x_t)
+        alpha_bar_t = extract(self.alphas_cumprod, t, x_t)
+        # 取得 alpha_bar_{t-1}
+        # t = 0 時先使用 index 0，之後再替換為 tensor 形式的 1.0
+        t_prev = (t - 1).clamp(min=0)
+        alpha_bar_prev = extract(self.alphas_cumprod, t_prev, x_t)
+        # 數學上 alpha_bar_{-1} = 1
+        alpha_bar_prev = torch.where((t == 0).reshape(-1, 1, 1, 1), torch.ones_like(alpha_bar_prev), alpha_bar_prev)
+        # 2. Convert the predicted noise into the predicted clean sample
+        #       x̂₀ = (x_t - √(1-ᾱ_t) * ε̂_θ) / √ᾱ_t
+        x0_pred = ( x_t - torch.sqrt( 1.0 - alpha_bar_t) * eps_theta) / torch.sqrt( alpha_bar_t)
+        #    and clamp it to [-1, 1].
+        x0_pred = torch.clamp( x0_pred, -1.0, 1.0)
+        # 3. Compute the posterior mean
+        #       \tilde{μ}_t = (√ᾱ_{t-1}·β_t/(1-ᾱ_t)) * x̂₀ + (√α_t·(1-ᾱ_{t-1})/(1-ᾱ_t)) * x_t.
+        # x0, xt的權重係數
+        coef_x0 = (torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t))
+        coef_xt = (torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t))
+        posterior_mean = coef_x0 * x0_pred + coef_xt * x_t
+        # 4. Compute the posterior variance \tilde{β}_t = ((1-ᾱ_{t-1})/(1-ᾱ_t)) * β_t.
+        posterior_var = ((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t) * beta_t)
+        # 加上 clamp(min=0.0)，防止 t=0 或數值浮點誤差導致根號內為負而產生 NaN
+        posterior_std = torch.sqrt(torch.clamp(posterior_var, min=0.0))
+        sigmas = torch.sqrt(posterior_var) # 不為負
+        # 5. Add Gaussian noise scaled by √(\tilde{β}_t) unless t == 0. # 反向採樣的隨機探索項
+        noise = torch.randn_like(x_t) # 抽樣標準高斯隨機變數 z ~ N(0, I)
+        nonzero_mask = (t != 0).float().reshape(-1, 1, 1, 1) # 當 t == 0 時，已經到達最後一步，不應該再加入隨機噪聲
+        #noise_term = (nonzero_mask) * torch.sqrt(posterior_var) * noise
+        # 6. Return the final sample at t-1.
+        # 簡化原先重複計算的根號變異數，直接複用已受 clamp 保護的 posterior_std
+        sample_prev = posterior_mean + nonzero_mask * posterior_std * noise
+        #sample_prev = posterior_mean + noise_term
         #######################
         return sample_prev
 
@@ -148,8 +192,36 @@ class DDPMScheduler(BaseScheduler):
             sample_prev: denoised image sample at timestep t-1
         """
         ######## TODO ########
-
-        sample_prev = None
+        # 統一將 t 轉換為 1D LongTensor 並搬移至正確裝置，避免測試中型別不相容引發報錯
+        t = t.reshape(-1).long().to(x_t.device)
+        # Remember to clamp x0_pred to [-1, 1], as in step_predict_noise.
+        x0_pred = torch.clamp(x0_pred, -1.0, 1.0)
+        # 取得posterior mean所需變數，每個 batch 的 t 可能不同，所以使用 extract
+        beta_t = extract(self.betas, t, x_t)
+        alpha_t = extract(self.alphas, t, x_t)
+        alpha_bar_t = extract(self.alphas_cumprod, t, x_t)
+        # 取得 alpha_bar_{t-1}
+        t_prev = (t - 1).clamp(min=0)
+        alpha_bar_prev = extract(self.alphas_cumprod, t_prev, x_t,)
+        # t = 0 時，定義 alpha_bar_{t-1} = 1
+        #alpha_bar_prev = torch.where(t.reshape(-1, 1, 1, 1) == 0, torch.ones_like(alpha_bar_prev), alpha_bar_prev,)
+        # 將 (t.reshape(...) == 0) 改寫為標準的 (t == 0).reshape(-1, 1, 1, 1)，與 step_predict_noise 保持一致的布林廣播行為
+        alpha_bar_prev = torch.where((t == 0).reshape(-1, 1, 1, 1), torch.ones_like(alpha_bar_prev), alpha_bar_prev)
+        # 3. 計算 posterior mean
+        coef_x0 = (torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar_t))
+        coef_xt = (torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t))
+        posterior_mean = coef_x0 * x0_pred + coef_xt * x_t
+        # 4. 計算 posterior variance
+        posterior_var = ((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t) * beta_t)
+        # 加上 clamp(min=0.0) 安全防護，避免微小負浮點數被送入開根號
+        posterior_std = torch.sqrt(torch.clamp(posterior_var, min=0.0))
+        # 5. t != 0 時才加入隨機噪音
+        noise = torch.randn_like(x_t) 
+        nonzero_mask = (t != 0).float().reshape(-1, 1, 1, 1) # 當 t == 0 時，已經到達最後一步，不應該再加入隨機噪聲
+        #noise_term = (nonzero_mask) * torch.sqrt(posterior_var) * noise
+        # 6. 得到 x_{t-1}
+        sample_prev = posterior_mean + nonzero_mask * posterior_std * noise
+        #sample_prev = posterior_mean + noise_term
         #######################
         return sample_prev
 
@@ -166,8 +238,26 @@ class DDPMScheduler(BaseScheduler):
             sample_prev: denoised image sample at timestep t-1
         """
         ######## TODO ########
-
-        sample_prev = None
+        # 統一將 t 轉換為 1D LongTensor 並搬移至正確裝置，避免測試中型別不相容引發報錯
+        t = t.reshape(-1).long().to(x_t.device)
+        posterior_mean = mean_theta
+        beta_t = extract(self.betas, t, x_t)
+        alpha_bar_t = extract(self.alphas_cumprod, t, x_t)
+        t_prev = (t - 1).clamp(min = 0)
+        # 先取得一般情況下的 alpha_bar_{t-1}
+        alpha_bar_prev = extract(self.alphas_cumprod, t_prev, x_t)
+        # 修正 t = 0 的特殊情況
+        # 數學上 alpha_bar_{-1} 定義為 1
+        #alpha_bar_prev = torch.where(t.reshape(-1, 1, 1, 1) == 0, torch.ones_like(alpha_bar_prev), alpha_bar_prev)
+        # 統一布林條件的 reshape 寫法
+        alpha_bar_prev = torch.where((t == 0).reshape(-1, 1, 1, 1), torch.ones_like(alpha_bar_prev), alpha_bar_prev)
+        posterior_var = ((1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t) * beta_t)
+        posterior_std = torch.sqrt(torch.clamp(posterior_var, min=0.0))
+        noise = torch.randn_like(x_t)
+        nonzero_mask = (t != 0).float().reshape(-1, 1, 1, 1) # 當 t == 0 時，已經到達最後一步，不應該再加入隨機噪聲
+        #noise_term = (nonzero_mask) * torch.sqrt(posterior_var) * noise
+        sample_prev = posterior_mean + nonzero_mask * posterior_std * noise
+        #sample_prev = posterior_mean + noise_term
         #######################
         return sample_prev
 
@@ -202,7 +292,8 @@ class DDPMScheduler(BaseScheduler):
         ######## TODO ########
         # DO NOT change the code outside this part.
         # Assignment 1. Implement the DDPM forward step.
-        x_t = None
+        alphas_prod_t = extract(self.alphas_cumprod, t, x_0)
+        x_t = torch.sqrt(alphas_prod_t) * x_0 + torch.sqrt(1.0 - alphas_prod_t) * eps
         #######################
 
         return x_t, eps
